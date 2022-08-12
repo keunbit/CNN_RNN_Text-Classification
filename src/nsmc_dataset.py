@@ -14,6 +14,8 @@ def load_nsmc_data(file_path: str):
         nsmc_data = {k: [] for k in col_name}
         for line in f:
             line = line.strip().split("\t")
+            if line[1] == "":
+                continue
             nsmc_data[col_name[0]].append(line[0])
             nsmc_data[col_name[1]].append(line[1])
             nsmc_data[col_name[2]].append(line[2])
@@ -58,6 +60,7 @@ def encoding_dataset(dataset: dict, vocab: dict, max_seq_len: int = 16, device=N
     encoded_dataset = {}
     encoded_texts = []
     encoded_labels = []
+    encoded_lengths = []
     for sentence, label in zip(dataset["document"], dataset["label"]):
         encoded_sent = []
         tokens, _ = tokenizer.tokenize(sentence)
@@ -69,8 +72,10 @@ def encoding_dataset(dataset: dict, vocab: dict, max_seq_len: int = 16, device=N
 
         # check length & add ["pad"] token or trim
         if len(encoded_sent) >= max_seq_len:
+            encoded_lengths.append(max_seq_len)
             encoded_sent = encoded_sent[:max_seq_len]
         else:
+            encoded_lengths.append(len(encoded_sent))
             pad_length = max_seq_len - len(encoded_sent)
             encoded_sent = encoded_sent + ([vocab["[PAD]"]] * pad_length)
 
@@ -80,10 +85,10 @@ def encoding_dataset(dataset: dict, vocab: dict, max_seq_len: int = 16, device=N
         encoded_texts.append(encoded_sent)
         encoded_labels.append(int(label))
 
-    encoded_dataset["document"] = torch.IntTensor(encoded_texts).to(device)
-    encoded_dataset["label"] = torch.LongTensor(encoded_labels).to(
-        device
-    )  # 학습때 nn.CrossEntropyLoss 계산시 LongTensor 타입(int64) 필요
+    # 학습때 nn.CrossEntropyLoss 계산시 LongTensor 타입(int64) 필요
+    encoded_dataset["document"] = torch.LongTensor(encoded_texts).to(device)
+    encoded_dataset["labels"] = torch.LongTensor(encoded_labels).to(device)
+    encoded_dataset["seq_len"] = torch.LongTensor(encoded_lengths).to(device)
 
     return encoded_dataset
 
@@ -92,10 +97,11 @@ class NSMCDataset(Dataset):
     def __init__(self, encoded_dataset):
         super(NSMCDataset, self).__init__()
         self.texts = encoded_dataset["document"]
-        self.labels = encoded_dataset["label"]
+        self.labels = encoded_dataset["labels"]
+        self.seq_len = encoded_dataset["seq_len"]
 
     def __len__(self):
         return len(self.texts)
 
     def __getitem__(self, index):
-        return self.texts[index], self.labels[index]
+        return {"input_ids": self.texts[index], "labels": self.labels[index], "seq_len": self.seq_len[index]}

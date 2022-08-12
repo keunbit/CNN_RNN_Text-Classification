@@ -6,12 +6,11 @@ import random
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from model import NlpCNN, load_pretrained_vector
+from model import NlpCNN, NlpRNN, load_pretrained_vector
 from nsmc_dataset import NSMCDataset, encoding_dataset, load_nsmc_data, make_vocab
 from tokenizer.tokenizer_processor import (
     BasicTokenizer,
@@ -27,6 +26,8 @@ logger = logging.getLogger("looger")
 stream_handler = logging.StreamHandler()
 logger.addHandler(stream_handler)
 logger.setLevel(logging.DEBUG)
+
+MODEL_CLASS_MAPPER = {"cnn": NlpCNN, "rnn": NlpRNN, "lstm": NlpRNN, "gru": NlpRNN}
 
 TOKENIZER_CLASS_MAPPER = {
     "basic": BasicTokenizer,
@@ -172,16 +173,22 @@ def parse_args():
         "--val_check_interval", default=0.25, type=float, help="Check validation set X times during a training epoch"
     )
     parser.add_argument(
-        "--drop_out",
+        "--dropout",
         default=0.5,
         type=float,
         help="The number of model dropout",
     )
     parser.add_argument(
-        "--filter_size",
+        "--filter_window_size",
         default="3,4,5",
         type=str,
         help="The list of filter_size(kernel_size) CNN model",
+    )
+    parser.add_argument(
+        "--filter_features_dim",
+        default="100,100,100",
+        type=str,
+        help="The dimension of each filter_window(kernel) CNN model",
     )
     parser.add_argument(
         "--patience",
@@ -190,6 +197,25 @@ def parse_args():
         help="The number of validation epochs with no improvement after which training will be stopped.",
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default=None,
+        required=True,
+        choices=["cnn", "rnn", "lstm", "gru"],
+        help="Choice Model for training [CNN, RNN, LSTM, GRU]",
+    )
+    parser.add_argument(
+        "--bidirectional",
+        action="store_true",
+        help="If passed, will LSTM & GRU parameter use bidirectional.",
+    )
+    parser.add_argument(
+        "--hidden_size", type=int, default=128, help="Hidden size for RNN model (simple_RNN, LSTM, BiLSTM)"
+    )
+    parser.add_argument(
+        "--num_layers", type=int, default=1, help="Depth of layers RNN model (simple_RNN, LSTM, BiLSTM)"
+    )
 
     args = parser.parse_args()
 
@@ -213,11 +239,15 @@ def parse_args():
             assert extension in ["txt"], "`test_file` should be a txt file."
 
     # convert type [str -> int]
-    args.filter_size = [int(size_) for size_ in args.filter_size.split(",")]
+    args.filter_window_size = [int(size_) for size_ in args.filter_window_size.split(",")]
+    args.filter_features_dim = [int(size_) for size_ in args.filter_features_dim.split(",")]
     args.tokenizer_type = args.tokenizer_type.lower()
     args.optimizer_type = args.optimizer_type.lower()
+    args.model_type = args.model_type.lower()
 
-    assert args.val_check_interval >= 0
+    assert args.val_check_interval >= 0, "val_check_interval should be (>= 0)"
+    assert len(args.filter_window_size) == 3, "filter_window_size list length should be 3"
+    assert len(args.filter_features_dim) == 3, "filter_features_dim list length should be 3"
 
     return args
 
@@ -237,15 +267,16 @@ def main():
 
     train_data = os.path.join(args.data_dir, args.train_file)
     test_data = os.path.join(args.data_dir, args.test_file)
-    args.tokenizer = TOKENIZER_CLASS_MAPPER[args.tokenizer_type]()
-    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     train_data = load_nsmc_data(train_data)
     test_data = load_nsmc_data(test_data)
 
+    args.num_labels = len(list(set(test_data["label"])))
+    args.tokenizer = TOKENIZER_CLASS_MAPPER[args.tokenizer_type]()
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     logger.info("***** Tokenizing *****")
-    logger.info(f"  Tokenizer Type = {args.tokenizer.type_}")
     vocab, seq_len = make_vocab(train_data["document"], vocab_size=args.vocab_size, tokenizer=args.tokenizer)
+    logger.info(f"  Tokenizer Type = {args.tokenizer.type_}")
     logger.info(f"  Datasets tokens length(mean) = {seq_len['mean']}")
     logger.info(f"  Datasets tokens length(median) = {seq_len['median']}")
 
@@ -256,19 +287,24 @@ def main():
 
     if args.use_pretrained:
         pretraiend_model_path = os.path.join(args.pretrained_path, args.pretrained_file)
-        pretrained_embedding, count = load_pretrained_vector(vocab=vocab, model_path=pretraiend_model_path)
-        cnn_model = NlpCNN(
-            pretrained_embedding=pretrained_embedding,
-            freeze_embedding=args.freeze_embedding,
-            vocab_size=args.vocab_size,
-        )
-        logger.info(f"  There are {count} / {len(vocab)} pretrained vectors found.")
+        args.pretrained_embedding, args.count = load_pretrained_vector(vocab=vocab, model_path=pretraiend_model_path)
+        args.vocab_size, args.embed_dim = args.pretrained_embedding.size()
+        logger.info(f"  There are {args.count} / {len(vocab)} pretrained vectors found.")
     else:
-        cnn_model = NlpCNN(vocab_size=args.vocab_size, pad_token_id=args.pad_token_id)
+        # define embed_dim
+        args.embed_dim = 300  # fix 300
+        args.pad_token_id = 0  # fix 0
+        args.pretrained_embedding = None
+        # model = NlpCNN(vocab_size=args.vocab_size, pad_token_id=args.pad_token_id)
 
-    cnn_model.to(args.device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = OPTIMIZER_MAPPER[args.optimizer_type](cnn_model.parameters(), lr=args.learning_rate)
+    if args.model_type in ["rnn", "lstm", "gru"]:
+        model = MODEL_CLASS_MAPPER["rnn"](args)
+    # CNN model
+    else:
+        model = MODEL_CLASS_MAPPER["cnn"](args)
+
+    model.to(args.device)
+    optimizer = OPTIMIZER_MAPPER[args.optimizer_type](model.parameters(), lr=args.learning_rate)
 
     # prepare dataset & dataloader
     encoded_train = encoding_dataset(
@@ -310,10 +346,9 @@ def main():
 
     for _ in range(args.num_train_epochs):
         for train_step, batch in enumerate(train_dataloader):
-            cnn_model.train()
-            b_intput_ids, b_labels = batch
-            outs = cnn_model(b_intput_ids)
-            loss = criterion(outs, b_labels)
+            model.train()
+            outs = model(**batch)
+            loss = outs["loss"]
 
             optimizer.zero_grad()
             loss.backward()
@@ -331,23 +366,23 @@ def main():
                 )
                 # evaluate
                 batch_accumulate_score = 0
-                cnn_model.eval()
+                batch_accumulate_loss = 0
+                model.eval()
                 for batch in test_dataloader:
                     with torch.no_grad():
-                        b_intput_ids, b_labels = batch
-                        outs = cnn_model(b_intput_ids)
-
-                        loss = criterion(outs, b_labels)
-                        preds = torch.argmax(outs, 1).flatten()
-
-                        accuracy = (preds == b_labels).cpu().numpy().mean()
+                        outs = model(**batch)
+                        preds = torch.argmax(outs["logits"], 1).flatten()
+                        accuracy = (preds == batch["labels"]).cpu().numpy().mean()
                         batch_accumulate_score += accuracy
+                        batch_accumulate_loss += outs["loss"].item()
                         valid_progress_bar.update(1)
 
                 # eval score result
                 eval_step_score = round(batch_accumulate_score / len(test_dataloader), 4)
+                eval_step_loss = round(batch_accumulate_loss / len(test_dataloader), 4)
                 logger.info(f"*** Test Result ({completed_steps} step) ***")
                 logger.info(f"  test/accuracy = {eval_step_score*100}%")
+                logger.info(f"  test/loss = {eval_step_loss}")
 
                 # write score
                 cur_epochs = round(completed_steps / train_steps_per_epoch, 3)
@@ -359,11 +394,11 @@ def main():
                     # cur socre is best
                     best_score = eval_step_score
                     cur_patience = 0
-                    save_model(args, ckpt_version=ckpt_version, ckpt_model=cnn_model)
+                    save_model(args, ckpt_version=ckpt_version, ckpt_model=model)
                 else:
                     cur_patience += 1
                     logger.info(
-                        f"test/accuracy was not in top 1 (best score: {best_score}% / cur patience: {cur_patience})"
+                        f"test/accuracy was not in top 1 (best score: {best_score*100}% / cur patience: {cur_patience})"
                     )
 
                     if cur_patience >= args.patience:

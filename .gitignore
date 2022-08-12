@@ -135,4 +135,4 @@ dmypy.json
 test.ipynb
 data/
 models/
-outs/
+outs*/
